@@ -47,11 +47,23 @@ DAC_HandleTypeDef hdac1;
 DMA_HandleTypeDef hdma_dac1_ch1;
 DMA_HandleTypeDef hdma_dac1_ch2;
 
+TIM_HandleTypeDef htim14;
 TIM_HandleTypeDef htim16;
 
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
+
+extern TIM_HandleTypeDef htim14;
+
+
+#define CPR 90   // cycles per revolution
+#define EDGES_PER_CYCLE (CPR * 4) // quadrature edges
+
+#define QUAD_A_PIN GPIO_PIN_4
+#define QUAD_B_PIN GPIO_PIN_5
+#define QUAD_PORT GPIOA
+
 int16_t value_adc0;
 int16_t value_adc1;
 int16_t value_adc2;
@@ -62,10 +74,40 @@ int16_t avg_x;
 int16_t avg_y;
 
 uint16_t AD_RES_BUFFER[4];
-float angle;
-int16_t angle_scaled;
+volatile float angle;
+volatile float last_angle;
+volatile int16_t angle_scaled;
 
 volatile uint32_t counter = 0;
+volatile uint8_t output_counter = 0;
+
+
+// Add variable to store PA4/PA5 input states
+uint8_t mode1 = 0;
+uint8_t mode2 = 0;
+
+uint8_t mode = 0; // 0 = normal, 1 = quadrature
+
+volatile uint8_t pa4_state = 0;
+volatile uint8_t pa5_state = 0;
+
+static uint8_t quad_state = 0;
+static int32_t edges_remaining = 0;
+static int dir = 1;
+
+static float edge_accum = 0;
+
+static uint8_t first_sample = 1;   // flag to ignore startup delta
+
+static int32_t current_edge_index = 0;  // running output position
+
+// Timer handle
+extern TIM_HandleTypeDef htim14;
+
+// Gray-code sequence for quadrature
+static const uint8_t states[4][2] = {
+    {0,0}, {1,0}, {1,1}, {0,1}
+};
 
 /* USER CODE END PV */
 
@@ -77,6 +119,7 @@ static void MX_ADC1_Init(void);
 static void MX_DAC1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM16_Init(void);
+static void MX_TIM14_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -87,21 +130,94 @@ void PA4_PA5_SetInput(void) {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     __HAL_RCC_GPIOA_CLK_ENABLE();
 
+
     GPIO_InitStruct.Pin = GPIO_PIN_4 | GPIO_PIN_5;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
 }
 
-void PA4_PA5_SetDAC(void) {
+void PA4_PA5_SetOutput(void) {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     __HAL_RCC_GPIOA_CLK_ENABLE();
 
-    GPIO_InitStruct.Pin = GPIO_PIN_4 | GPIO_PIN_5;
-    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+
+    GPIO_InitStruct.Pin = GPIO_PIN_4| GPIO_PIN_5;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
 }
+
+void PA4_PA5_SetDAC(void) {
+    MX_DAC1_Init();
+}
+
+void Quad_OutputStep(void)
+{
+    if (edges_remaining == 0) return;
+
+    // Advance state
+    if (dir > 0) quad_state = (quad_state + 1) & 0x03;
+    else         quad_state = (quad_state - 1) & 0x03;
+
+    // Write pins
+    pa4_state = states[quad_state][0];
+    pa5_state = states[quad_state][1];
+    HAL_GPIO_WritePin(QUAD_PORT, QUAD_A_PIN, pa4_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(QUAD_PORT, QUAD_B_PIN, pa5_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+    edges_remaining--;
+    if (edges_remaining == 0) {
+        HAL_TIM_Base_Stop_IT(&htim14); // stop timer if done
+    }
+}
+
+// Called every 200 Hz with new angle
+void Quad_Update(float angle)
+{
+    // Compute desired absolute edge index
+    int32_t target_edge_index = (int32_t)roundf((angle / 360.0f) * EDGES_PER_CYCLE);
+
+    // Wrap into valid range
+    target_edge_index = (target_edge_index % EDGES_PER_CYCLE + EDGES_PER_CYCLE) % EDGES_PER_CYCLE;
+
+    // Compute difference (how many steps we need to take)
+    int32_t diff = target_edge_index - current_edge_index;
+
+    // Handle wraparound shortest path
+    if (diff >  EDGES_PER_CYCLE/2) diff -= EDGES_PER_CYCLE;
+    if (diff < -EDGES_PER_CYCLE/2) diff += EDGES_PER_CYCLE;
+
+    if (diff == 0) return;
+
+    dir = (diff > 0) ? +1 : -1;
+    edges_remaining = (diff > 0) ? diff : -diff;
+
+    // Save new "goal"
+    current_edge_index = target_edge_index;
+
+    // Timer ticks per edge (scale with loop period, speed, etc.)
+    uint32_t ticks_per_edge_us = 2500 / edges_remaining;
+    if (ticks_per_edge_us < 10) ticks_per_edge_us = 10;
+
+    __HAL_TIM_SET_AUTORELOAD(&htim14, ticks_per_edge_us);
+    __HAL_TIM_SET_COUNTER(&htim14, 0);
+    HAL_TIM_Base_Start_IT(&htim14);
+}
+
+// Init GPIO
+void Quad_Init(void)
+{
+
+
+    HAL_GPIO_WritePin(QUAD_PORT, QUAD_A_PIN | QUAD_B_PIN, GPIO_PIN_RESET);
+    quad_state = 0;
+    edges_remaining = 0;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -136,27 +252,51 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
-
+  MX_DAC1_Init();
+  MX_USART1_UART_Init();
+  MX_TIM16_Init();
+  MX_TIM14_Init();
   /* USER CODE BEGIN 2 */
+  HAL_ADCEx_Calibration_Start(&hadc1);
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)AD_RES_BUFFER, 4);
 
   // Set PA4/PA5 as input for first 0.5s
   PA4_PA5_SetInput();
 
-  // Wait 0.5 seconds (500 ms)
-  HAL_Delay(500);
+  HAL_Delay(10);
+
+  // Read PA4 and PA5 input states and save to byte
+  for (int i = 0; i < 20; i++) {
+	  mode1 += ((HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4) ? 1 : 0));
+	  mode2 += ((HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_5) ? 1 : 0));
+	  HAL_Delay(1);
+  }
+  if (mode1 > 17 && mode2 > 17) {
+	  // Both pins high, enter quadrature mode
+	  mode = 1;
+  }
+  else {
+	  mode = 0;
+  }
+
+
 
   // Set PA4/PA5 back to DAC mode
-  PA4_PA5_SetDAC();
+  if (mode == 0) {
+	  MX_DAC1_Init();
+	  PA4_PA5_SetDAC();
 
-  MX_DAC1_Init();
+	  HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);
+	  HAL_DAC_Start(&hdac1, DAC_CHANNEL_2);
+  }
 
-  HAL_ADCEx_Calibration_Start(&hadc1);
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)AD_RES_BUFFER, 4);
+  if (mode == 1) {
+	  PA4_PA5_SetOutput();
+	  Quad_Init();
+	  HAL_TIM_Base_Start_IT(&htim14);
 
-  HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);
+  }
 
-  MX_USART1_UART_Init();
-  MX_TIM16_Init();
   HAL_TIM_Base_Start_IT(&htim16);
   /* USER CODE END 2 */
 
@@ -354,6 +494,37 @@ static void MX_DAC1_Init(void)
 }
 
 /**
+  * @brief TIM14 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM14_Init(void)
+{
+
+  /* USER CODE BEGIN TIM14_Init 0 */
+
+  /* USER CODE END TIM14_Init 0 */
+
+  /* USER CODE BEGIN TIM14_Init 1 */
+
+  /* USER CODE END TIM14_Init 1 */
+  htim14.Instance = TIM14;
+  htim14.Init.Prescaler = 64-1;
+  htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim14.Init.Period = 10-1;
+  htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim14) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM14_Init 2 */
+
+  /* USER CODE END TIM14_Init 2 */
+
+}
+
+/**
   * @brief TIM16 Initialization Function
   * @param None
   * @retval None
@@ -371,7 +542,7 @@ static void MX_TIM16_Init(void)
   htim16.Instance = TIM16;
   htim16.Init.Prescaler = 640-1;
   htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim16.Init.Period = 1000-1;
+  htim16.Init.Period = 250-1;
   htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim16.Init.RepetitionCounter = 0;
   htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -459,6 +630,7 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -466,6 +638,12 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pins : PA6 PA7 */
+  GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -488,6 +666,9 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
+    if (htim == &htim14) {
+        Quad_OutputStep();
+    }
     if (htim == &htim16) {
         int32_t local_diff_x, local_diff_y;
         uint32_t local_counter;
@@ -510,9 +691,38 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         }
 
         angle = atan2f(avg_y, avg_x) * 57.2958f;
-        angle_scaled = 62 + (angle + 180.0f) * 3850.0f / 360.0f;
 
-        HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, angle_scaled);
+        if (mode == 1) {
+                if (first_sample) {
+                    // Seed angle so no huge delta on startup
+                    last_angle = angle;
+                    edge_accum = 0.0f;
+                    edges_remaining = 0;
+                    first_sample = 0;
+                } else {
+                    float delta = angle - last_angle;
+
+                    // Wrap to -180..180
+                    if (delta > 180.0f) delta -= 360.0f;
+                    if (delta < -180.0f) delta += 360.0f;
+                    if (fabsf(delta) > 0.1f) {
+                    	Quad_Update(delta);
+                    	last_angle = angle;
+                    }
+                }
+            }
+        else {
+            // DAC mode
+
+            angle_scaled += (angle + 180.0f) * 3848.0f / 360.0f;
+            output_counter++;
+            if (output_counter >= 4) { // 100 Hz update
+				HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, angle_scaled/4);
+				HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_2, DAC_ALIGN_12B_R, angle_scaled/4);
+				output_counter = 0;
+				angle_scaled = 0;
+            }
+        }
     }
 }
 /* USER CODE END 4 */
