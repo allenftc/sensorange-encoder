@@ -100,9 +100,12 @@ static float edge_accum = 0;
 static uint8_t first_sample = 1;   // flag to ignore startup delta
 
 static int32_t current_edge_index = 0;  // running output position
+static int32_t target_edge_index = 0;   // target position
 
 // Timer handle
 extern TIM_HandleTypeDef htim14;
+
+static float total_angle = 0.0f;
 
 // Gray-code sequence for quadrature
 static const uint8_t states[4][2] = {
@@ -155,6 +158,30 @@ void PA4_PA5_SetDAC(void) {
     MX_DAC1_Init();
 }
 
+void Quad_Update(float delta)
+{
+    total_angle += delta;
+
+    // Wrap total_angle to [-180, 180]
+    if (total_angle > 180.0f) total_angle -= 360.0f;
+    if (total_angle < -180.0f) total_angle += 360.0f;
+
+    target_edge_index = (int32_t)roundf((total_angle / 360.0f) * EDGES_PER_CYCLE);
+    int32_t diff = target_edge_index - current_edge_index;
+    if (diff == 0) return;
+
+    dir = (diff > 0) ? +1 : -1;
+    edges_remaining = abs(diff);
+
+    float sample_period_us = 2500.0f;
+    uint32_t ticks_per_edge_us = edges_remaining > 0 ? (uint32_t)(sample_period_us / edges_remaining) : 10;
+    if (ticks_per_edge_us < 10) ticks_per_edge_us = 10;
+
+    __HAL_TIM_SET_AUTORELOAD(&htim14, ticks_per_edge_us);
+    __HAL_TIM_SET_COUNTER(&htim14, 0);
+    HAL_TIM_Base_Start_IT(&htim14);
+}
+
 void Quad_OutputStep(void)
 {
     if (edges_remaining == 0) return;
@@ -171,42 +198,13 @@ void Quad_OutputStep(void)
 
     edges_remaining--;
     if (edges_remaining == 0) {
-        HAL_TIM_Base_Stop_IT(&htim14); // stop timer if done
+        current_edge_index = target_edge_index; // update only after all steps
+        HAL_TIM_Base_Stop_IT(&htim14);
     }
 }
 
-// Called every 200 Hz with new angle
-void Quad_Update(float angle)
-{
-    // Compute desired absolute edge index
-    int32_t target_edge_index = (int32_t)roundf((angle / 360.0f) * EDGES_PER_CYCLE);
 
-    // Wrap into valid range
-    target_edge_index = (target_edge_index % EDGES_PER_CYCLE + EDGES_PER_CYCLE) % EDGES_PER_CYCLE;
 
-    // Compute difference (how many steps we need to take)
-    int32_t diff = target_edge_index - current_edge_index;
-
-    // Handle wraparound shortest path
-    if (diff >  EDGES_PER_CYCLE/2) diff -= EDGES_PER_CYCLE;
-    if (diff < -EDGES_PER_CYCLE/2) diff += EDGES_PER_CYCLE;
-
-    if (diff == 0) return;
-
-    dir = (diff > 0) ? +1 : -1;
-    edges_remaining = (diff > 0) ? diff : -diff;
-
-    // Save new "goal"
-    current_edge_index = target_edge_index;
-
-    // Timer ticks per edge (scale with loop period, speed, etc.)
-    uint32_t ticks_per_edge_us = 2500 / edges_remaining;
-    if (ticks_per_edge_us < 10) ticks_per_edge_us = 10;
-
-    __HAL_TIM_SET_AUTORELOAD(&htim14, ticks_per_edge_us);
-    __HAL_TIM_SET_COUNTER(&htim14, 0);
-    HAL_TIM_Base_Start_IT(&htim14);
-}
 
 // Init GPIO
 void Quad_Init(void)
@@ -705,10 +703,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                     // Wrap to -180..180
                     if (delta > 180.0f) delta -= 360.0f;
                     if (delta < -180.0f) delta += 360.0f;
-                    if (fabsf(delta) > 0.1f) {
-                    	Quad_Update(delta);
-                    	last_angle = angle;
-                    }
+                    Quad_Update(delta);
+                    last_angle = angle;
                 }
             }
         else {
